@@ -1,478 +1,643 @@
+/* 
 
-// ------------------------------------------------------------------------------------------------------------------------------
-// ------------------                      Portable AI Voice Assistant Project by techiesms                         ------------------
-// ----------------                                       Aug 28, 2024                                              ------------------
-// ------------------                                                                                               ------------------
-// ------------------                      This is the modified code and the ordignial code was                     ------------------
-// ------------------                      from KALOPROJECTS. A huge Shoutout to his amazing work                   ------------------
-//                      KALO PROJECTS Github Repo - https://github.com/kaloprojects/KALO-ESP32-Voice-Assistant
-// ------------------------------------------------------------------------------------------------------------------------------
+The Code was test with 
 
-
-// *** HINT: in case of an 'Sketch too Large' Compiler Warning/ERROR in Arduino IDE (ESP32 Dev Module):
-// -> select a larger 'Partition Scheme' via menu > tools: e.g. using 'No OTA (2MB APP / 2MB SPIFFS) ***
-
-
-/*
-Library to be installed 
-
-ESP32 Audio I2S -  https://github.com/schreibfaul1/ESP32-audioI2S
-ArduinoJSON - https://arduinojson.org/?utm_source=meta&utm_medium=library.properties
-SimpleTimer - https://github.com/kiryanenko/SimpleTimer
+   Arduino 1.8.13
+   ESP32 BOARD PACKAGE 1.0.6
+   TJpg_Decoder By Bodmer 0.0.3
+   TFT_SPI By Bodmer 2.3.4
+   lvgl By kisvegabor 7.8.1
 
 */
-
-
-#define VERSION "\n=== KALO ESP32 Voice Assistant (last update: July 22, 2024) ======================"
-
-#include <WiFi.h>  // only included here
-#include <SD.h>    // also needed in other tabs (.ino)
-
-#include <Audio.h>  // needed for PLAYING Audio (via I2S Amplifier, e.g. MAX98357) with ..
-                    // Audio.h library from Schreibfaul1: https://github.com/schreibfaul1/ESP32-audioI2S
-                    // .. ensure you have actual version (July 18, 2024 or newer needed for 8bit wav files!)
-#include <Arduino.h>
-#include <WiFiClientSecure.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
+#include <Base64.h>
+#include <lvgl.h>
+#include "esp_camera.h"
 #include <ArduinoJson.h>
-#include <SimpleTimer.h>
 
-String text;
-String filteredAnswer = "";
-String repeat;
-SimpleTimer Timer;
-float batteryVoltage;
+const char* ssid = "SSID";
+const char* password = "PASS";
+
+const String apiKey = "YOUR GPT-4o API KEY";
+
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+#define FLASH_GPIO_NUM 4  // Flash pin (if using external flash)
+#define BUZZER_PIN 3      // Buzzer connected to GPIO3 (for sound indication)
+#define BUTTON_PIN 1      // Button pin for triggering capture (GPIO 1)
 
 
+TFT_eSPI tft = TFT_eSPI();
+static lv_disp_buf_t disp_buf;               // Buffer to hold pixel data for LVGL
+static lv_color_t buf[LV_HOR_RES_MAX * 10];  // Buffer to store pixel data for LVGL
 
-// --- PRIVATE credentials -----
+// Declare pointers for LVGL keyboard and text area objects
+static lv_obj_t* kb;
+static lv_obj_t* ta;
 
-const char* ssid = "Kayilaivendhan";                                                       // ## INSERT your wlan ssid
-const char* password = "Karthi2004";                                                // ## INSERT your password
-const char* OPENAI_KEY = "***************************************";  // ## optionally (needed for Open AI voices): INSERT your OpenAI key
-const char* gemini_KEY = "AIzaSyCjSKVBww5MvDXuyQY_JjI27lU2nAVj00U";                   //gemini api
-#define TTS_MODEL 0                                                                   // 1 = OpenAI TTS; 0 = Google TTS
+String userInputText = "";        // Holds the text entered by the user
+String capturedImageBase64 = "";  // Holds the Base64-encoded image data
+
+bool flashOn = false;              // Track flash state
+bool isCaptureMode = false;        // Indicates if the system is in capture mode
+bool isResponseDisplayed = false;  // Indicates if a response has been displayed
+
+camera_fb_t* capturedFrameBuffer = nullptr;  // Holds the captured frame buffer
 
 
+// Function to encode image to Base64
+String encodeImageToBase64(uint8_t* imageData, size_t imageSize) {
+  return base64::encode((const uint8_t*)imageData, imageSize);
+}
 
-String OpenAI_Model = "gpt-3.5-turbo-instruct";  // Model
-String OpenAI_Temperature = "0.20";              // temperature
-String OpenAI_Max_Tokens = "100";                //Max Tokens
 
-#define AUDIO_FILE "/Audio.wav"  // mandatory, filename for the AUDIO recording
-
-#define TTS_GOOGLE_LANGUAGE "en-IN"  // needed for Google TTS voices only (not needed for multilingual OpenAI voices :) \
-                                     // examples: en-US, en-IN, en-BG, en-AU, nl-NL, nl-BE, de-DE, th-TH etc. \
-                                     // more infos: https://cloud.google.com/text-to-speech/docs/voices
-
-// --- PIN assignments ---------
-
-#define pin_RECORD_BTN 36
-#define pin_VOL_POTI 34
-#define pin_repeat 13
-
-#define pin_LED_RED 15
-#define pin_LED_GREEN 2
-#define pin_LED_BLUE 4
-
-#define pin_I2S_DOUT 25  // 3 pins for I2S Audio Output (Schreibfaul1 audio.h Library)
-#define pin_I2S_LRC 26
-#define pin_I2S_BCLK 27
-#define SD_AMP 32
-
-// --- global Objects ----------
-
-Audio audio_play;
-
-// declaration of functions in other modules (not mandatory but ensures compiler checks correctly)
-// splitting Sketch into multiple tabs see e.g. here: https://www.youtube.com/watch?v=HtYlQXt14zU
-
-bool I2S_Record_Init();
-bool Record_Start(String filename);
-bool Record_Available(String filename, float* audiolength_sec);
-
-String SpeechToText_Deepgram(String filename);
-void Deepgram_KeepAlive();
-//for battry
-const int batteryPin = 34;             // Pin 34 for battery voltage reading
-const float R1 = 100000.0;             // 100k ohm resistor
-const float R2 = 10000.0;              // 10k ohm resistor
-const float adcMax = 4095.0;           // Max value for ADC on ESP32
-const float vRef = 3.4;                // Reference voltage for ESP32
-const int numSamples = 100;            // Number of samples for averaging
-const float calibrationFactor = 1.48;  // Calibration factor for ADC reading
-
-// ------------------------------------------------------------------------------------------------------------------------------
 void setup() {
-  // Initialize serial communication
   Serial.begin(115200);
-  Serial.setTimeout(100);  // 10 times faster reaction after CR entered (default is 1000ms)
-  pinMode(batteryPin, INPUT);
-  analogReadResolution(12);  // 12-bit ADC resolution
 
+  displayInit();
+  drawBorders();
 
-  // Pin assignments:
-  pinMode(pin_LED_RED, OUTPUT);
-  pinMode(pin_LED_GREEN, OUTPUT);
-  pinMode(pin_LED_BLUE, OUTPUT);
-  pinMode(SD_AMP, OUTPUT);
-  pinMode(pin_RECORD_BTN, INPUT);  // use INPUT_PULLUP if no external Pull-Up connected ##
-  pinMode(pin_repeat, INPUT);
-  pinMode(12, OUTPUT);
-  digitalWrite(12, LOW);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(FLASH_GPIO_NUM, OUTPUT);
+  digitalWrite(FLASH_GPIO_NUM, LOW);  // Ensure flash is off initially
 
-  // on INIT: walk 1 sec thru 3 RGB colors (RED -> GREEN -> BLUE), then stay on GREEN
-  led_RGB(50, 0, 0);
-  delay(500);
-  led_RGB(0, 50, 0);
-  delay(500);
-  led_RGB(0, 0, 50);
-  delay(500);
-  led_RGB(0, 0, 0);
+  displayLargeCenteredMessage("AI CAMERA BY TECHIESMS");
+  delay(1000);
 
-
-  // Hello World
-  Serial.println(VERSION);
-  Timer.setInterval(10000);
-  // Connecting to WLAN
-  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  Serial.print("Connecting WLAN ");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println(". Done, device connected.");
-  led_RGB(0, 50, 0);  // GREEN
 
-  // Initialize SD card
-  if (!SD.begin()) {
-    Serial.println("ERROR - SD Card initialization failed!");
+
+  displayLargeCenteredMessage("Connecting to WiFi...");
+  delay(500);
+  Serial.println("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.println("...");
+  }
+  Serial.println("WiFi Connected!");
+  Serial.println("IP Address: " + WiFi.localIP().toString());
+  displayLargeCenteredMessage("WiFi Connected!");
+  delay(500);
+
+  cameraInit();  // Initialize camera
+  lvglInit();    // Initialize LVGL (LittlevGL) graphics library
+  lv_layout();   // Initialize LVGL layout and interface
+}
+
+
+// Initializes the TFT display and sets up touch calibration and image decoder
+void displayInit() {
+  tft.begin();
+  tft.setRotation(1);  // Set display rotation (1 is usually landscape mode)
+  tft.fillScreen(TFT_BLACK);
+
+  uint16_t calData[5] = { 292, 3562, 332, 3384, 7 };  // Calibration data for the touch screen
+  tft.setTouch(calData);                              // Set the touch calibration data for the screen
+
+  drawBorders();
+
+  TJpgDec.setJpgScale(1);           // Set the scale of the JPEG image (1 means no scaling)
+  TJpgDec.setSwapBytes(true);       // Set byte swapping to handle different color formats correctly
+  TJpgDec.setCallback(tft_output);  // Set the callback function to draw the image on TFT display
+}
+
+
+// LVGL display flush callback function for rendering the display buffer on the screen
+void my_disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.pushColors(&color_p->full, w * h, true);
+  tft.endWrite();
+
+  lv_disp_flush_ready(disp);
+}
+
+
+// Callback function used by the JPEG decoder to draw an image on the TFT screen
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  if (y >= tft.height()) return 0;
+  tft.pushImage(x, y, w, h, bitmap);
+  return 1;
+}
+
+
+// Captures and displays a camera feed on the TFT display
+void displayCameraFeed() {
+  camera_fb_t* fb = esp_camera_fb_get();  // Capture a frame from the camera
+  if (!fb) {
+    Serial.println("Camera Capture Failed: Frame buffer is NULL!");
     return;
   }
 
-  // initialize KALO I2S Recording Services (don't forget!)
-  I2S_Record_Init();
+  // Check if the captured frame is in the correct format (JPEG)
+  if (fb->format != PIXFORMAT_JPEG) {
+    Serial.println("Camera Capture Failed: Incorrect format!");
+    esp_camera_fb_return(fb);
+    return;
+  }
 
-  // INIT Audio Output (via Audio.h, see here: https://github.com/schreibfaul1/ESP32-audioI2S)
-  audio_play.setPinout(pin_I2S_BCLK, pin_I2S_LRC, pin_I2S_DOUT);
-
-  audio_play.setVolume(21);  //21
-  // INIT done, starting user interaction
-  Serial.println("> HOLD button for recording AUDIO .. RELEASE button for REPLAY & Deepgram transcription");
+  // Draw the captured JPEG image on the screen using the JPEG decoder
+  TJpgDec.drawJpg(80, 5, (const uint8_t*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  drawBorders();
 }
 
 
+void cameraInit() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 9000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
 
-// ------------------------------------------------------------------------------------------------------------------------------
-void loop() {
-
-
-here:
-
-  if (digitalRead(pin_RECORD_BTN) == LOW)  // Recording started (ongoing)
-  {
-    led_RGB(50, 0, 0);  //  RED means 'Recording ongoing'
-    delay(30);          // unbouncing & suppressing button 'click' noise in begin of audio recording
-
-    // Before we start any recording we stop any earlier Audio Output or streaming (e.g. radio)
-    if (audio_play.isRunning()) {
-      audio_play.connecttohost("");  // 'audio_play.stopSong()' wouldn't be enough (STT wouldn't reconnect)
-    }
-
-    //Start Recording
-    Record_Start(AUDIO_FILE);
+  if (esp_camera_init(&config) != ESP_OK) {
+    displayMessage("Camera Initialization Failed!");
+    return;
   }
-
-  if (digitalRead(pin_RECORD_BTN) == HIGH)  // Recording not started yet .. OR stopped now (on release button)
-  {
-    led_RGB(0, 0, 0);
-
-    float recorded_seconds;
-    if (Record_Available(AUDIO_FILE, &recorded_seconds))  //  true once when recording finalized (.wav file available)
-    {
-      if (recorded_seconds > 0.4)  // ignore short btn TOUCH (e.g. <0.4 secs, used for 'audio_play.stopSong' only)
-      {
-        // ## Demo 1 - PLAY your own recorded AUDIO file (from SD card)
-        // Hint to 8bit: you need AUDIO.H library from July 18,2024 or later (otherwise 8bit produce only loud (!) noise)
-        // we commented out Demo 1 to jump to Demo 2 directly  .. uncomment once if you want to listen to your record !
-        /*audio_play.connecttoFS(SD, AUDIO_FILE );              // play your own recorded audio  
-        while (audio_play.isRunning()) {audio_play.loop();}     // wait here until done (just for Demo purposes)  */
-
-        // ## Demo 2 [SpeechToText] - Transcript the Audio (waiting here until done)
-        // led_RGB(HIGH, HIGH, LOW);  // BLUE means: 'Deepgram server creates transcription'
-
-        String transcription = SpeechToText_Deepgram(AUDIO_FILE);
-
-        //led_RGB(HIGH, LOW, HIGH);  // GREEN means: 'Ready for recording'
-        String again = "Please Ask Again . . . . . . . . . . . ";
+  displayLargeCenteredMessage("Camera Initialized!");
+  delay(500);
+  drawBorders();
+}
 
 
-        Serial.println(transcription);
-        if (transcription == "") {
-          led_RGB(0, 0, 50);
-          digitalWrite(SD_AMP,HIGH);
-          if (TTS_MODEL == 1)
-            audio_play.openai_speech(OPENAI_KEY, "tts-1", again, "shimmer", "mp3", "1");  //ONYX,shimmer,alloy (Uncomment this to use OpenAI TTS)
-          else
-            speakTextInChunks(again, 93);  // ( Uncomment this to use Google TTS )
-          Serial.println("Please Ask Again");
-          while (audio_play.isRunning())  // wait here until finished (just for Demo purposes, before we play Demo 4)
-          {
-            audio_play.loop();
-          }
-          goto here;
-        }
+void lvglInit() {
+  lv_init();  // Initialize LVGL
+
+  lv_disp_buf_init(&disp_buf, buf, NULL, LV_HOR_RES_MAX * 10);  // Initialize the display buffer and driver
+
+  lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = 480;
+  disp_drv.ver_res = 320;
+  disp_drv.flush_cb = my_disp_flush;  // Custom flush function to update screen
+  disp_drv.buffer = &disp_buf;
+  lv_disp_drv_register(&disp_drv);
+
+  // Initialize touch input device driver
+  lv_indev_drv_t indev_drv;
+  lv_indev_drv_init(&indev_drv);
+  indev_drv.type = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb = my_touchpad_read;  // Custom touchpad read function
+  lv_indev_drv_register(&indev_drv);
+
+  // Initialize layout
+  lv_layout();
+}
+
+void lv_layout() {
+  // Create a material theme for consistency
+  lv_theme_t* th = lv_theme_material_init(LV_THEME_DEFAULT_COLOR_PRIMARY, LV_THEME_DEFAULT_COLOR_SECONDARY, LV_THEME_MATERIAL_FLAG_DARK, LV_THEME_DEFAULT_FONT_SMALL, LV_THEME_DEFAULT_FONT_NORMAL, LV_THEME_DEFAULT_FONT_SUBTITLE, LV_THEME_DEFAULT_FONT_TITLE);
+
+  lv_obj_t* scr = lv_obj_create(NULL, NULL);
+  lv_scr_load(scr);
+
+  // Flash button
+  lv_obj_t* flashBtn = lv_btn_create(scr, NULL);
+  lv_obj_set_pos(flashBtn, 412, 55);  // Adjust as needed
+  lv_obj_set_size(flashBtn, 50, 50);
+  lv_obj_set_event_cb(flashBtn, flash_btn_event_cb);
+  lv_obj_t* flashLabel = lv_label_create(flashBtn, NULL);
+  lv_label_set_text(flashLabel, "Flash");
+
+  // Capture button
+  lv_obj_t* captureBtn = lv_btn_create(scr, NULL);
+  lv_obj_set_pos(captureBtn, 408, 125);  // Adjust as needed
+  lv_obj_set_size(captureBtn, 70, 65);
+  lv_obj_set_event_cb(captureBtn, capture_btn_event_cb);
+  lv_obj_t* captureLabel = lv_label_create(captureBtn, NULL);
+  lv_label_set_text(captureLabel, "Capture");
+
+  // Bottom message label
+  lv_obj_t* messageLabel = lv_label_create(scr, NULL);
+  lv_label_set_text(messageLabel, "Press the button to capture a new image");
+  // Position the label at the bottom
+  lv_obj_align(messageLabel, NULL, LV_ALIGN_IN_BOTTOM_MID, 0, -30);
+}
 
 
-
-        //----------------------------------------------------
-        WiFiClientSecure client;
-        client.setInsecure();  // Disable SSL verification for simplicity (not recommended for production)
-        String Answer = "";    // Declare Answer variable here
-
-        text = "";
-
-        if (client.connect("generativelanguage.googleapis.com", 443)) {
-          String url = "/v1beta/models/gemini-1.5-flash:generateContent?key=" + String(gemini_KEY);
-
-          String payload = String("{\"contents\": [{\"parts\":[{\"text\":\"" + transcription + "\"}]}],\"generationConfig\": {\"maxOutputTokens\": " + OpenAI_Max_Tokens + "}}");
-
-
-          // Send the HTTP POST request
-          client.println("POST " + url + " HTTP/1.1");
-          client.println("Host: generativelanguage.googleapis.com");
-          client.println("Content-Type: application/json");
-          client.print("Content-Length: ");
-          client.println(payload.length());
-          client.println();
-          client.println(payload);
-
-          // Read the response
-          String response;
-          while (client.connected()) {
-            String line = client.readStringUntil('\n');
-            if (line == "\r") {
-              break;
-            }
-          }
-
-          // Read the actual response
-          response = client.readString();
-          parseResponse(response);
-        } else {
-          Serial.println("Connection failed!");
-        }
-
-        client.stop();  // End the connection
-        //----------------------------------------------------
-
-        if (filteredAnswer != "")  // we found spoken text .. now starting Demo examples:
-        {
-          led_RGB(0, 0, 50);
-          digitalWrite(SD_AMP,HIGH);
-          Serial.print("OpenAI speaking: ");
-          Serial.println(filteredAnswer);
-
-          if (TTS_MODEL == 1)
-            audio_play.openai_speech(OPENAI_KEY, "tts-1", filteredAnswer.c_str(), "shimmer", "mp3", "1");  //ONYX,shimmer,alloy (Uncomment this to use OpenAI TTS)
-          else
-            speakTextInChunks(filteredAnswer, 92);  // ( Uncomment this to use Google TTS )
-        }
-      }
-    }
-  }
-
-
-
-  //for repeat-------------------------
-  if (digitalRead(pin_repeat) == LOW) {
-    delay(500);
-    analogWrite(pin_LED_BLUE, 50);
-    digitalWrite(SD_AMP,HIGH);
-    Serial.print("repeat - ");
-    Serial.println(repeat);
-    if (TTS_MODEL == 1)
-      audio_play.openai_speech(OPENAI_KEY, "tts-1", repeat, "shimmer", "mp3", "1");  //ONYX,shimmer,alloy (Uncomment this to use OpenAI TTS)
-    else
-      speakTextInChunks(repeat, 92);  // ( Uncomment this to use Google TTS )
-  }
-
-  audio_play.loop();
-
-  if (audio_play.isRunning()) {
-
-    analogWrite(pin_LED_BLUE, 50);
-    digitalWrite(SD_AMP,HIGH);
-    if (digitalRead(pin_RECORD_BTN) == LOW) {
-      goto here;
-
-  
-    }
-  } else {
-
-      analogWrite(pin_LED_BLUE, 0);
-      digitalWrite(SD_AMP,LOW);
-  }
-
-  String batt = "battery low. please charge";
-  if (Timer.isReady()) {
-    battry_filtering();
-    Serial.print("Battery Voltage: ");
-    Serial.println(batteryVoltage);
-    if (batteryVoltage < 3.4) {
-      if (TTS_MODEL == 1)
-      audio_play.openai_speech(OPENAI_KEY, "tts-1", batt.c_str(), "shimmer", "mp3", "1");
-      else
-      speakTextInChunks(batt.c_str(), 92);  // ( Uncomment this to use Google TTS )
-    }
-
-    Timer.reset();
-  }
-
-  // Schreibfaul1 loop für Play Audio
-
-
-
-  // [Optional]: Stabilize WiFiClientSecure.h + Improve Speed of STT Deepgram response (~1 sec faster)
-  // Idea: Connect once, then sending each 5 seconds dummy bytes (to overcome Deepgram auto-closing 10 secs after last request)
-  // keep in mind: WiFiClientSecure.h still not 100% reliable (assuming RAM heap issue, rarely freezes after e.g. 10 mins)
-
-  if (digitalRead(pin_RECORD_BTN) == HIGH && !audio_play.isRunning())  // but don't do it during recording or playing
-  {
-    static uint32_t millis_ping_before;
-    if (millis() > (millis_ping_before + 5000)) {
-      millis_ping_before = millis();
-      led_RGB(0, 0, 0);  // short LED OFF means: 'Reconnection server, can't record in moment'
-      Deepgram_KeepAlive();
-    }
+void flash_btn_event_cb(lv_obj_t* btn, lv_event_t event) {
+  if (event == LV_EVENT_CLICKED) {
+    flashOn = !flashOn;
+    digitalWrite(FLASH_GPIO_NUM, flashOn ? HIGH : LOW);
+    Serial.println(flashOn ? "Flash ON" : "Flash OFF");
   }
 }
 
-void speakTextInChunks(String text, int maxLength) {
-  int start = 0;
-  while (start < text.length()) {
-    int end = start + maxLength;
 
-    // Ensure we don't split in the middle of a word
-    if (end < text.length()) {
-      while (end > start && text[end] != ' ' && text[end] != '.' && text[end] != ',') {
-        end--;
-      }
-    }
-
-    // If no space or punctuation is found, just split at maxLength
-    if (end == start) {
-      end = start + maxLength;
-    }
-
-    String chunk = text.substring(start, end);
-    audio_play.connecttospeech(chunk.c_str(), TTS_GOOGLE_LANGUAGE);
-
-    while (audio_play.isRunning()) {
-      digitalWrite(SD_AMP,HIGH);
-      audio_play.loop();
-      if (digitalRead(pin_RECORD_BTN) == LOW) {
-        break;
-      }
-    }
-
-    start = end + 1;  // Move to the next part, skipping the space
-                      // delay(200);       // Small delay between chunks
+void capture_btn_event_cb(lv_obj_t* btn, lv_event_t event) {
+  if (event == LV_EVENT_CLICKED) {
+    Serial.println("Button clicked, capturing image...");
+    displayLargeCenteredMessage("Capturing Image...");
+    delay(100);
+    captureAndProcessImage();
   }
 }
 
-// ------------------------------------------------------------------------------------------------------------------------------
 
-// Revised section to handle response parsing
-void parseResponse(String response) {
-  repeat = "";
-  // Extract JSON part from the response
-  int jsonStartIndex = response.indexOf("{");
-  int jsonEndIndex = response.lastIndexOf("}");
+void createKeyboard() {
 
-  if (jsonStartIndex != -1 && jsonEndIndex != -1) {
-    String jsonPart = response.substring(jsonStartIndex, jsonEndIndex + 1);
-     Serial.println("Clean JSON:");
-     Serial.println(jsonPart);
+  // Create a new screen for the keyboard and text area
+  lv_obj_t* keyboard_screen = lv_obj_create(NULL, NULL);
+  lv_scr_load(keyboard_screen);  // Load the new screen
+  lv_obj_set_style_local_bg_opa(keyboard_screen, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, LV_OPA_COVER);
+  lv_obj_set_style_local_bg_color(keyboard_screen, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, LV_COLOR_BLACK);
 
-    DynamicJsonDocument doc(1024);  // Increase size if needed
-    DeserializationError error = deserializeJson(doc, jsonPart);
+  // Create the text area
+  lv_obj_t* ta_question = lv_textarea_create(keyboard_screen, NULL);
+  lv_obj_set_size(ta_question, 400, 100);
+  lv_obj_align(ta_question, NULL, LV_ALIGN_IN_TOP_MID, 0, 20);
+  lv_textarea_set_placeholder_text(ta_question, "Enter your question:");
+  lv_textarea_set_text(ta_question, "");
 
-    if (error) {
-      Serial.print("DeserializeJson failed: ");
-      Serial.println(error.c_str());
-      return;
-    }
+  // Create the keyboard
+  lv_obj_t* kb = lv_keyboard_create(keyboard_screen, NULL);
+  lv_obj_set_size(kb, LV_HOR_RES, LV_VER_RES / 2);
+  lv_obj_align(kb, NULL, LV_ALIGN_IN_BOTTOM_MID, 0, 0);
+  lv_keyboard_set_cursor_manage(kb, true);
 
-    if (doc.containsKey("candidates")) {
-      for (const auto& candidate : doc["candidates"].as<JsonArray>()) {
-        if (candidate.containsKey("content") && candidate["content"].containsKey("parts")) {
+  // Apply keyboard styles
+  static lv_style_t kb_style;
+  lv_style_init(&kb_style);
+  lv_style_set_bg_color(&kb_style, LV_STATE_DEFAULT, LV_COLOR_GRAY);
+  lv_style_set_bg_opa(&kb_style, LV_STATE_DEFAULT, LV_OPA_COVER);
+  lv_style_set_border_width(&kb_style, LV_STATE_DEFAULT, 0);
 
-          for (const auto& part : candidate["content"]["parts"].as<JsonArray>()) {
-            if (part.containsKey("text")) {
-              text += part["text"].as<String>();
-            }
-          }
-          text.trim();
-          // Serial.print("Extracted Text: ");
-          // Serial.println(text);
-          filteredAnswer = "";
-          for (size_t i = 0; i < text.length(); i++) {
-            char c = text[i];
-            if (isalnum(c) || isspace(c) || c == ',' || c == '.' || c == '\'') {
-              filteredAnswer += c;
-            } else {
-              filteredAnswer += ' ';
-            }
-          }
-          // filteredAnswer = text;
-          // Serial.print("FILTERED - ");
-          //Serial.println(filteredAnswer);
+  lv_obj_add_style(kb, LV_OBJ_PART_MAIN, &kb_style);
 
-          repeat = filteredAnswer;
-        }
-      }
+  lv_keyboard_set_textarea(kb, ta_question);
+  lv_obj_set_event_cb(kb, keyboard_event_cb);  // Attach event callback
+}
+
+void keyboard_event_cb(lv_obj_t* kb, lv_event_t event) {
+  lv_keyboard_def_event_cb(kb, event);  // Handle default keyboard behavior
+
+  if (event == LV_EVENT_APPLY) {
+    // Retrieve the text from the text area linked to the keyboard
+    lv_obj_t* ta_question = lv_keyboard_get_textarea(kb);
+    const char* text = lv_textarea_get_text(ta_question);
+
+    userInputText = String(text);  // Store user input
+    Serial.println("User Input: " + userInputText);
+
+    // Process the input with the captured image
+    if (!capturedImageBase64.isEmpty()) {
+      exampleVisionQuestionWithImage(userInputText, capturedImageBase64);
     } else {
-      Serial.println("No 'candidates' field found in JSON response.");
+      displayMessage("Error: Failed to encode image.");
+    }
+  }
+
+  if (event == LV_EVENT_CANCEL) {
+
+
+    // Retrieve the text area linked to the keyboard
+    lv_obj_t* ta_question = lv_keyboard_get_textarea(kb);
+
+    if (ta_question) {
+      // Clear the text area content (you can set an empty string)
+      lv_textarea_set_text(ta_question, "");
+    }
+  }
+}
+
+void captureAndProcessImage() {
+
+
+  // Capture the image from the camera
+  capturedFrameBuffer = esp_camera_fb_get();
+
+  if (!capturedFrameBuffer) {
+    Serial.println("Camera capture failed");
+    displayMessage("Error: Camera capture failed");
+  }
+
+  // Encode the captured image to Base64
+  capturedImageBase64 = encodeImageToBase64(capturedFrameBuffer->buf, capturedFrameBuffer->len);
+
+  // Immediately turn off the flash when the button is pressed
+  if (flashOn) {
+    digitalWrite(FLASH_GPIO_NUM, LOW);  // Turn off flash (GPIO 4)
+    flashOn = false;
+    Serial.println("Flash OFF");
+  }
+
+
+  beep();
+
+  if (capturedImageBase64.isEmpty()) {
+    Serial.println("Failed to encode the image!");
+    displayMessage("Error: Image encoding failed");
+
+    esp_camera_fb_return(capturedFrameBuffer);  // Return the frame buffer
+    capturedFrameBuffer = nullptr;
+  }
+
+  Serial.println("Image encoded to Base64");
+
+
+  // Stop the live feed by setting isCaptureMode to true
+  isCaptureMode = true;
+
+  // Display the captured image
+  tft.fillScreen(TFT_BLACK);  // Clear the screen
+  drawBorders();              // Draw borders around the screen
+
+  if (capturedFrameBuffer) {
+    TJpgDec.drawJpg(80, 5, capturedFrameBuffer->buf, capturedFrameBuffer->len);
+  }
+
+  displayLargeCenteredMessage("Opening the keyboard...");
+
+  delay(3000);  // Wait for 3 seconds
+
+  // Show the keyboard for user input
+  createKeyboard();
+
+  drawBorders();
+}
+
+void exampleVisionQuestionWithImage(const String& userInputText, const String& base64Image) {
+  String url = "data:image/jpeg;base64," + base64Image;
+
+  DynamicJsonDocument doc(4096);
+  doc["model"] = "gpt-4o";
+  JsonArray messages = doc.createNestedArray("messages");
+  JsonObject message = messages.createNestedObject();
+  message["role"] = "user";
+  JsonArray content = message.createNestedArray("content");
+
+  JsonObject textContent = content.createNestedObject();
+  textContent["type"] = "text";
+  textContent["text"] = userInputText;  // User question
+
+  JsonObject imageContent = content.createNestedObject();
+  imageContent["type"] = "image_url";
+  JsonObject imageUrlObject = imageContent.createNestedObject("image_url");
+  imageUrlObject["url"] = url;
+  imageContent["image_url"]["detail"] = "auto";
+
+  doc["max_tokens"] = 400;
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("Sending request to ChatGPT...");
+  Serial.println("User Input: " + userInputText);
+  Serial.println("Base64 Image Size: " + String(base64Image.length()));
+
+  // Clear the screen
+  tft.fillScreen(TFT_BLACK);
+  drawBorders();
+
+  // Display the captured image
+  if (capturedFrameBuffer) {
+    TJpgDec.drawJpg(80, 5, capturedFrameBuffer->buf, capturedFrameBuffer->len);
+  }
+
+  // Display the "Sending request" message
+  displayLargeCenteredMessage("Sending request to ChatGPT...");
+
+  String result;
+  if (sendPostRequest(payload, result)) {
+    displayCapturedImageAndResponse(result);
+    Serial.println("Response received from ChatGPT:");
+    Serial.println(result);
+  } else {
+    Serial.println("Error: Unable to get a response from ChatGPT");
+    displayCapturedImageAndResponse("Error: Unable to get response from ChatGPT");
+  }
+}
+
+
+bool sendPostRequest(const String& payload, String& result) {
+  HTTPClient http;
+  http.begin("https://api.openai.com/v1/chat/completions");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + apiKey);
+
+  int httpCode = http.POST(payload);
+  if (httpCode > 0) {
+    if (httpCode == HTTP_CODE_OK) {
+      result = http.getString();
+      http.end();
+      return true;
+    } else {
+      Serial.println("HTTP Error Code: " + String(httpCode));
     }
   } else {
-    Serial.println("No valid JSON found in the response.");
+    Serial.println("POST request failed.");
+  }
+  http.end();
+  return false;
+}
+
+
+
+void displayCapturedImageAndResponse(const String& result) {
+  // Parse the ChatGPT response
+  StaticJsonDocument<2000> doc;
+  DeserializationError error = deserializeJson(doc, result);
+  const char* response = "Error: Parsing failed";  // Default message if parsing fails
+  if (!error) {
+    response = doc["choices"][0]["message"]["content"];
+  }
+
+  // Display the captured image
+  if (capturedFrameBuffer) {
+    TJpgDec.drawJpg(80, 5, capturedFrameBuffer->buf, capturedFrameBuffer->len);
+  }
+
+
+  // Display the response message
+  displayMessage(response);  // Custom function for displaying message
+
+  while (!isResponseDisplayed) {
+    uint16_t touchX = 0, touchY = 0;
+    if (tft.getTouch(&touchX, &touchY, 600)) {  // If touch detected
+      Serial.println("Touch detected, reinitializing display...");
+      isResponseDisplayed = 1;
+    }
+    delay(10);
+  }
+
+  if (isResponseDisplayed) {
+    isResponseDisplayed = 0;
+    reinitializeDisplay();  // Reinitialize display on touch
   }
 }
 
 
-void led_RGB(int red, int green, int blue) {
-  static bool red_before, green_before, blue_before;
-  // writing to real pin only if changed (increasing performance for frequently repeated calls)
-  if (red != red_before) {
-    analogWrite(pin_LED_RED, red);
-    red_before = red;
+void reinitializeDisplay() {
+  // Clear the screen and reset the display
+  tft.fillScreen(TFT_WHITE);  // Clear the screen
+  drawBorders();              // Draw borders around the screen
+
+  // Reinitialize any required settings or layouts
+  capturedFrameBuffer = nullptr;
+  capturedImageBase64 = "";
+  isCaptureMode = false;
+
+  Serial.println("Display reinitialized successfully");
+
+  // Load the initial layout for the interface (if you are using a layout function)
+  lv_layout();  // This should load the layout you want to display
+}
+
+
+void loop() {
+  static unsigned long lastPressTime = 0;  // Debounce button press
+  unsigned long currentMillis = millis();
+
+  // Handle button press for toggling flash and capturing image
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    // Check debounce time (ignores multiple button presses in quick succession)
+    if (currentMillis - lastPressTime > 200) {
+      lastPressTime = currentMillis;
+
+
+      // Proceed with capturing the image
+      displayLargeCenteredMessage("Capturing Image...");
+      captureAndProcessImage();
+    }
+
+    // Wait until the button is released to avoid multiple triggers
+    while (digitalRead(BUTTON_PIN) == LOW) {
+      delay(10);  // Debounce and wait for release
+    }
   }
-  if (green != green_before) {
-    analogWrite(pin_LED_GREEN, green);
-    green_before = green;
+
+  // Show live camera feed if not in capture mode and not displaying the response
+  if (!isCaptureMode && !isResponseDisplayed) {
+    displayCameraFeed();
   }
-  if (blue != blue_before) {
-    analogWrite(pin_LED_BLUE, blue);
-    blue_before = blue;
+
+  // Check for touch event only after the image and response have been displayed
+  if (isResponseDisplayed) {
+    uint16_t touchX = 0, touchY = 0;
+    if (tft.getTouch(&touchX, &touchY, 600)) {  // If touch detected
+      Serial.println("Touch detected, reinitializing display...");
+      reinitializeDisplay();        // Reinitialize display on touch
+      isResponseDisplayed = false;  // Reset the flag after reinitialization
+    }
+  }
+
+  lv_task_handler();  // Handle LVGL tasks
+  delay(5);           // Small delay to balance responsiveness and CPU usage
+}
+
+
+// Function to handle touchpad input for LVGL
+bool my_touchpad_read(lv_indev_drv_t* indev_driver, lv_indev_data_t* data) {
+  uint16_t touchX, touchY;
+
+  bool touched = tft.getTouch(&touchX, &touchY, 600);  // Get touch input from the screen, with a threshold of 600 (sensitivity)
+
+  if (!touched) {
+    data->state = LV_INDEV_STATE_REL;
+  } else {
+    data->state = LV_INDEV_STATE_PR;  // Set the state as "pressed" (touch detected)
+    data->point.x = touchX;
+    data->point.y = touchY;
+  }
+
+  return false;
+}
+
+
+void drawBorders() {
+  tft.drawRect(78, 2, 324, 246, TFT_WHITE);
+  tft.drawRect(3, tft.height() - 70, 472, 68, TFT_WHITE);
+}
+
+void displayMessage(const String& message) {
+  tft.fillRect(5, tft.height() - 65, 464, 60, TFT_BLACK);  // Reserve bottom section for messages with black background
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);                  // White text on black background
+  tft.setTextSize(1);
+  tft.setCursor(5, tft.height() - 65);
+
+  int cursorX = 5, cursorY = tft.height() - 65;
+  String currentWord;
+
+  for (char c : message) {
+    if (c == ' ' || c == '\n') {
+      if (cursorX + tft.textWidth(currentWord) > tft.width() - 5) {
+        cursorX = 5;
+        cursorY += 10;
+      }
+      if (cursorY >= tft.height() - 5) break;
+      tft.setCursor(cursorX, cursorY);
+      tft.print(currentWord);
+      cursorX += tft.textWidth(currentWord) + tft.textWidth(" ");
+      currentWord = "";
+    } else {
+      currentWord += c;
+    }
+  }
+
+  if (!currentWord.isEmpty()) {
+    if (cursorX + tft.textWidth(currentWord) > tft.width() - 5) {
+      cursorX = 5;
+      cursorY += 10;
+    }
+    tft.setCursor(cursorX, cursorY);
+    tft.print(currentWord);
   }
 }
-void battry_filtering() {
-  float adcValueSum = 0;
 
-  // ADC Averaging
-  for (int i = 0; i < numSamples; i++) {
-    adcValueSum += analogRead(batteryPin);
-    delay(2);
-  }
+void displayLargeCenteredMessage(const String& message) {
+  tft.fillRect(0, tft.height() - 70, tft.width(), 70, TFT_BLACK);  // Clear the message area with black background
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);  // White text on black background
 
-  float adcValueAvg = adcValueSum / numSamples;
-  batteryVoltage = adcValueAvg * (vRef / adcMax) * calibrationFactor;
-  batteryVoltage = batteryVoltage * ((R1 + R2) / R2);
+  int x = (tft.width() - tft.textWidth(message)) / 2;
+  int y = tft.height() - 50;  // Ensure this doesn't overlap with buttons
 
-  // Publishing the calculated battery voltage to Adafruit IO
-  Serial.print("Battery Voltage: ");
-  Serial.println(batteryVoltage);
+  tft.setCursor(x, y);
+  tft.print(message);
+  drawBorders();
+}
 
-  //photocell.publish(batteryVoltage);
+void beep() {
+  digitalWrite(3, HIGH);
+  delay(300);
+  digitalWrite(3, LOW);
 }
